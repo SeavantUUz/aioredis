@@ -4,7 +4,7 @@ import sys
 import warnings
 import types
 
-from .connection import create_connection, _PUBSUB_COMMANDS
+from .connection import create_connection, _PUBSUB_COMMANDS, RedisConnection
 from .log import logger
 from .util import async_task, _NOTSET
 from .errors import PoolClosedError
@@ -239,7 +239,7 @@ class ConnectionsPool(AbcPool):
     @asyncio.coroutine
     def _wait_execute(self, address, command, args, kw):
         """Acquire connection and execute command."""
-        conn = yield from self.acquire(command, args)
+        conn, _ = yield from self.acquire(command, args)
         try:
             return (yield from conn.execute(command, *args, **kw))
         finally:
@@ -300,7 +300,7 @@ class ConnectionsPool(AbcPool):
         return types.MappingProxyType({})
 
     @asyncio.coroutine
-    def acquire(self, command=None, args=()):
+    def acquire(self, command=None, args=()) -> (RedisConnection, bool):
         """Acquires a connection from free pool.
 
         Creates new connection if needed.
@@ -317,9 +317,12 @@ class ConnectionsPool(AbcPool):
                     assert not conn.closed, conn
                     assert conn not in self._used, (conn, self._used)
                     self._used.add(conn)
-                    return conn
+                    return conn, False
                 else:
-                    yield from self._cond.wait()
+                    # yield from self._cond.wait()
+                    address = self.address
+                    conn = yield from self._create_new_connection(address)
+                    return conn, True
 
     def release(self, conn):
         """Returns used connection back into pool.
@@ -410,14 +413,14 @@ class ConnectionsPool(AbcPool):
 
     def __iter__(self):
         # this method is needed to allow `yield`ing from pool
-        conn = yield from self.acquire()
-        return _ConnectionContextManager(self, conn)
+        conn, disposable = yield from self.acquire()
+        return _ConnectionContextManager(self, conn, disposable)
 
     if PY_35:
         def __await__(self):
             # To make `with await pool` work
-            conn = yield from self.acquire()
-            return _ConnectionContextManager(self, conn)
+            conn, disposable = yield from self.acquire()
+            return _ConnectionContextManager(self, conn, disposable=disposable)
 
         def get(self):
             '''Return async context manager for working with connection.
@@ -430,27 +433,34 @@ class ConnectionsPool(AbcPool):
 
 class _ConnectionContextManager:
 
-    __slots__ = ('_pool', '_conn')
+    __slots__ = ('_pool', '_conn', '_disposable')
 
-    def __init__(self, pool, conn):
+    def __init__(self, pool, conn, disposable=False):
         self._pool = pool
         self._conn = conn
+        self._disposable = disposable
 
     def __enter__(self):
         return self._conn
 
     def __exit__(self, exc_type, exc_value, tb):
-        try:
-            self._pool.release(self._conn)
-        finally:
+        if self._disposable:
+            self._conn.close()
+            yield from self._conn.wait_closed()
             self._pool = None
             self._conn = None
+        else:
+            try:
+                self._pool.release(self._conn)
+            finally:
+                self._pool = None
+                self._conn = None
 
 
 if PY_35:
     class _AsyncConnectionContextManager:
 
-        __slots__ = ('_pool', '_conn')
+        __slots__ = ('_pool', '_conn', '_disposable')
 
         def __init__(self, pool):
             self._pool = pool
@@ -458,14 +468,21 @@ if PY_35:
 
         @asyncio.coroutine
         def __aenter__(self):
-            conn = yield from self._pool.acquire()
+            conn, _disposable = yield from self._pool.acquire()
             self._conn = conn
+            self._disposable = _disposable
             return self._conn
 
         @asyncio.coroutine
         def __aexit__(self, exc_type, exc_value, tb):
-            try:
-                self._pool.release(self._conn)
-            finally:
+            if self._disposable:
+                self._conn.close()
+                yield from self._conn.wait_closed()
                 self._pool = None
                 self._conn = None
+            else:
+                try:
+                    self._pool.release(self._conn)
+                finally:
+                    self._pool = None
+                    self._conn = None
